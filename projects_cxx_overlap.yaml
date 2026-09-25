@@ -1,0 +1,190 @@
+- project: ffmpeg
+  language: c++
+  error_time: '2025-12-29'
+  oss-fuzz_sha: 8dfdeaaa5b1a4c796e61bec6386153d46f3a21c2
+  fuzzing_build_error_log: https://oss-fuzz-build-logs.storage.googleapis.com/log-0a8b1119-f383-4ae2-8bd5-1328a871ae29.txt
+  software_repo_url: https://github.com/FFmpeg/FFmpeg
+  software_sha: 9ab2a437a108469e90bbbfb9dd8dc29ece1c806b
+  engine: afl
+  sanitizer: address
+  architecture: x86_64
+  base_image_digest: d3d8677becbf294a659cb94161133231e290a4794d4bed344d3d6d8274f76cd5
+  error_category: RC25
+  fixed_state: 'no'
+  cxx_membership:
+  - dataset: top100
+    source: https://github.com/FFmpeg/FFmpeg.git
+- project: ffmpeg
+  language: c++
+  error_time: '2025-12-05'
+  oss-fuzz_sha: ee2ba6094402cac75e7b30fa407b679a0a717cf3
+  fuzzing_build_error_log: https://oss-fuzz-build-logs.storage.googleapis.com/log-a5ccd55e-8bce-429a-a6eb-ba534f91692c.txt
+  software_repo_url: https://github.com/FFmpeg/FFmpeg
+  software_sha: 52c84b06d59d50de6844e75fa06ee50a23fb717a
+  engine: afl
+  sanitizer: address
+  architecture: x86_64
+  base_image_digest: bdbe44209365fbbabc2c1a83e7a67cc69cc843caf641ffa1c53f357a284873c0
+  error_category: RC9
+  fixed_state: 'no'
+  cxx_membership:
+  - dataset: top100
+    source: https://github.com/FFmpeg/FFmpeg.git
+- project: librdkafka
+  language: c++
+  error_time: '2025-11-07'
+  oss-fuzz_sha: e2e0de976046449b23332a0b888017e075b55b31
+  fuzzing_build_error_log: https://oss-fuzz-build-logs.storage.googleapis.com/log-71a4b4f8-7c46-48de-8632-eda01bfeff4f.txt
+  software_repo_url: https://github.com/edenhill/librdkafka
+  software_sha: 616fb6e8074e82e0302f1c7d2896d7e577f8eb9b
+  engine: afl
+  sanitizer: address
+  architecture: x86_64
+  base_image_digest: 0c229e61349e6e5f4dbcfd433b2b0b5906012d49216675a6402ad1ed270715c4
+  error_category: 'RC9: Dependency issues'
+  root_cause_commit: caf7047da56ddb51343cf6661fe259d7a166144d
+  root_cause_workspace: DOWNSTREAM
+  fixed_state: 'no'
+  cxx_membership:
+  - dataset: awesome_cpp
+    source: data/awesome/librdkafka
+- project: libvips
+  language: c++
+  error_time: '2025-12-03'
+  oss-fuzz_sha: c8c1b257db4da92299bdf9fd058fff1bb008b2ad
+  fuzzing_build_error_log: https://oss-fuzz-build-logs.storage.googleapis.com/log-e8e310ea-fadf-48e2-9b51-406f00234cee.txt
+  software_repo_url: https://github.com/libvips/libvips.git
+  software_sha: 7b9d8234386915b46c6de6304469782ed99d7a5f
+  engine: afl
+  sanitizer: address
+  architecture: x86_64
+  base_image_digest: a6e85b2d7c098ed87d8c51980d24ae07b262a2becf42fd099d02c90f07e51d98
+  error_category: RC9
+  fixed_state: 'no'
+  cxx_membership:
+  - dataset: awesome_cpp
+    source: data/awesome/libvips
+- project: glaze
+  language: c++
+  error_time: '2025-09-16'
+  oss-fuzz_sha: 9ca5b10546881cf67145b6b8e707b7d79c7b4950
+  fuzzing_build_error_log: https://oss-fuzz-build-logs.storage.googleapis.com/log-26e2e2a3-d98f-4f65-afe2-e539c8f4482d.txt
+  software_repo_url: https://github.com/stephenberry/glaze
+  software_sha: e5540f239d99853bc4611c8f348be565810fa6cd
+  engine: afl
+  sanitizer: address
+  architecture: x86_64
+  base_image_digest: 192b038764086fcd174a3afd7341abe6e922701b0d8440524552fd9976e72a30
+  error_category: RC13
+  root_cause_commit: c398e85bb02290cdd7207ad57c2c36ab787e11d8
+  root_cause_workspace: UPSTREAM
+  fixed_state: 'no'
+  cxx_membership:
+  - dataset: awesome_cpp
+    source: data/awesome/glaze
+- project: lwan
+  language: c++
+  error_time: '2025-05-12'
+  oss-fuzz_sha: e9d36924052c7af1d5bd82071760c1eb114e898b
+  fuzzing_build_error_log: https://oss-fuzz-build-logs.storage.googleapis.com/log-80ff7bd1-d840-4a16-ba27-ad0d86c1b5b5.txt
+  software_repo_url: https://github.com/lpereira/lwan.git
+  software_sha: e7ac7f13afd1e060bfef61d2ec5d2a60f356b0eb
+  engine: afl
+  sanitizer: address
+  architecture: x86_64
+  base_image_digest: 2d948a5c2c9c11c50ff8a59da5916e4eec1c9abf2638cfe683d96e804994aa5b
+  error_category: RC13
+  root_cause_commit: 6c0c7fb17a54e1780f009b447c2020cbb918b11d
+  root_cause_workspace: UPSTREAM
+  fixed_state: 'no'
+  cxx_membership:
+  - dataset: top100
+    source: https://github.com/lpereira/lwan.git
+- project: duckdb
+  language: c++
+  error_time: '2026-05-29'
+  oss-fuzz_sha: 3fa060f3d9cf0b50368439181d94f23cb51bde42
+  fuzzing_build_error_log: https://oss-fuzz-build-logs.storage.googleapis.com/log-2383b611-2272-417d-bf97-e6d6d0f4d0a5.txt
+  software_repo_url: https://github.com/duckdb/duckdb
+  software_sha: 7290174816dfb595a611aa87879ca9c2f3b5bd8a
+  engine: honggfuzz
+  sanitizer: address
+  architecture: x86_64
+  base_image_digest: afa8f97dbfd3b2368c717c231f14e2299cb02fe928358184f942e0dd673d8838
+  error_category: RC13
+  root_cause_commit: 83b35085f1123e3d78ea46c5ae9f9b677a9ee991
+  root_cause_workspace: UPSTREAM
+  fixed_state: 'no'
+  cxx_membership:
+  - dataset: top100
+    source: https://github.com/duckdb/duckdb.git
+- project: lwan
+  language: c++
+  error_time: '2026-04-24'
+  oss-fuzz_sha: 36a9970605b0c9ca0d982df01f2f82bbb62f3bdd
+  fuzzing_build_error_log: https://oss-fuzz-build-logs.storage.googleapis.com/log-578da3de-ea52-4af8-b02a-b23b44711b69.txt
+  software_repo_url: https://github.com/lpereira/lwan.git
+  software_sha: 0d1628946684b2cc4c643fa58751addd5dbbc4ba
+  engine: afl
+  sanitizer: address
+  architecture: x86_64
+  base_image_digest: 2b03c9febfc483ccbaab27fc94cf1b3413d81d714f6ff1ef27d880614361b2a6
+  error_category: RC13
+  root_cause_commit: 3cb40844ca42b22d525f22f4d704d8d832d603d3
+  root_cause_workspace: UPSTREAM
+  fixed_state: 'no'
+  cxx_membership:
+  - dataset: top100
+    source: https://github.com/lpereira/lwan.git
+- project: glaze
+  language: c++
+  error_time: '2025-12-19'
+  oss-fuzz_sha: 4c908a6e1075d20c9d0e59e7fff5fe8be4dfd914
+  fuzzing_build_error_log: https://oss-fuzz-build-logs.storage.googleapis.com/log-1cbc2276-23e1-4568-a7e9-5814ce96e849.txt
+  software_repo_url: https://github.com/stephenberry/glaze
+  software_sha: a67f6f03d25b2869b8a878a5fc6e7f8c20ed73e9
+  engine: afl
+  sanitizer: address
+  architecture: x86_64
+  base_image_digest: 6878d9fa5979df15166e69f79e340ad4dc686056f5c8bfcd76614ca492b73d9b
+  error_category: RC13
+  root_cause_commit: 4cbddc3e491f48390ada24651118bfbcd994820f
+  root_cause_workspace: UPSTREAM
+  fixed_state: 'no'
+  cxx_membership:
+  - dataset: awesome_cpp
+    source: data/awesome/glaze
+- project: hiredis
+  language: c
+  error_time: '2025-04-10'
+  oss-fuzz_sha: e9d36924052c7af1d5bd82071760c1eb114e898b
+  fuzzing_build_error_log: https://oss-fuzz-build-logs.storage.googleapis.com/log-ce84f796-6b52-4784-8e5a-c41c52a879b9.txt
+  software_repo_url: https://github.com/redis/hiredis
+  software_sha: e834b57f05871c05f7f13e461b78d20907aa3a02
+  engine: afl
+  sanitizer: address
+  architecture: x86_64
+  base_image_digest: c099d3d710d12d5d9a39498463ff10973977d1c7a85e9a0fbe00c7f0a0fa9fb8
+  error_category: RC13
+  root_cause_commit: f14e5a44f4f7ca672a74ab2381eea8b903d6ce61
+  root_cause_workspace: UPSTREAM
+  fixed_state: 'no'
+  cxx_membership:
+  - dataset: awesome_cpp
+    source: data/awesome/hiredis
+- project: tensorflow
+  language: c++
+  error_time: '2024-05-06'
+  oss-fuzz_sha: e9d36924052c7af1d5bd82071760c1eb114e898b
+  fuzzing_build_error_log: https://oss-fuzz-build-logs.storage.googleapis.com/log-3b3efa36-a25f-449f-b78e-01c9d6978147.txt
+  software_repo_url: https://github.com/tensorflow/tensorflow
+  software_sha: f6d3be7d28fab797f10f90548feb9a025160a10c
+  engine: libfuzzer
+  sanitizer: address
+  architecture: x86_64
+  base_image_digest: 19782f7fe8092843368894dbc471ce9b30dd6a2813946071a36e8b05f5b1e27e
+  error_category: RC13
+  fixed_state: 'no'
+  cxx_membership:
+  - dataset: top100
+    source: https://github.com/tensorflow/tensorflow.git

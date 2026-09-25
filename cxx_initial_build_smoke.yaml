@@ -1,0 +1,10 @@
+- project: 8cc
+  source_repo_url: https://github.com/rui314/8cc.git
+  mode: initial_build
+  fixed_state: 'no'
+  state: 'no'
+- project: mold
+  source_repo_url: https://github.com/rui314/mold.git
+  mode: initial_build
+  fixed_state: 'no'
+  state: 'no'
