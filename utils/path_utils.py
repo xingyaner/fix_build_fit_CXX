@@ -144,6 +144,26 @@ def validate_patch_path(file_path: str,
     if norm_path in ('', '.', './'):
         return True
 
+    # CXX initial-build batches may isolate all mutable artifacts beneath an
+    # explicit experiment root.  Permit only that run's process workspace and
+    # artifact directories; never broaden access to arbitrary sibling paths.
+    experiment_root = os.environ.get("FIX_BUILD_EXPERIMENT_DIR")
+    if experiment_root:
+        try:
+            experiment_rel = os.path.relpath(
+                os.path.abspath(experiment_root), os.path.abspath(DEFAULT_PROJECT_ROOT)
+            ).replace('\\', '/').rstrip('/')
+            experiment_prefixes = (
+                f"{experiment_rel}/process/",
+                f"{experiment_rel}/archive/",
+                f"{experiment_rel}/agent_logs/",
+                f"{experiment_rel}/initial_build_log_file/",
+            )
+            if any(norm_path.startswith(prefix) for prefix in experiment_prefixes):
+                return True
+        except ValueError:
+            pass
+
     # 进行白名单前缀比对
     for prefix in allowed_prefixes:
         prefix_norm = prefix.rstrip('/')
