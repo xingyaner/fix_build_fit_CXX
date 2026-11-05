@@ -148,14 +148,46 @@ This repository also contains generated, auditable CXXCrafter inputs:
   subset. Both are reported as successful builds with successful `make test`
   validation in CXXCrafter's released validation table.
 
+The CXX initial-build workflow uses the following experiment limits by
+default: a 90-minute total project deadline, at most eight Dockerfile versions
+(the initial version plus at most seven modifications), and at most five child
+processes for a batch.  The CLI accepts lower values for smoke tests but rejects
+higher values, so a normal run cannot exceed the experiment budget.
+
 Run one case first (the task YAML is updated with its result, so copy it when
 you need an immutable experiment input):
 
 ```bash
 # Existing C/C++ OSS-Fuzz failures compatible with CXXCrafter
-python agent.py --mode oss-fuzz --projects-file projects_cxx_compatible.yaml --project-limit 1
+python agent.py --mode oss-fuzz --projects-file yamls/projects_cxx_compatible.yaml --project-limit 1
 
 # Ordinary CXX initial build and Dockerfile repair: start with the two-case smoke test
 python agent.py --mode initial-build --projects-file cxx_initial_build_smoke.yaml \
-  --project-limit 1 --max-retries 2 --max-internal-rounds 6
+  --project-limit 1
 ```
+
+For every CXX initial-build run, the system writes a separate
+`experiment_stats.json` together with `result.txt` and the Docker build log to
+`archive/<project>/<timestamp>/`. The same evidence and the final project
+workspace are retained in `process/fixed/<project>_<timestamp>/` after a
+success or `process/unfixed/<project>_<timestamp>/` after a failure.
+
+For the CXX Top100 batch, `--initial-build-parallelism` defaults to 5.  The
+reference CXXCrafter paper reports 4,297,652 input and 624,170 output tokens
+for its full Top100 experiment; those are reference measurements, not a token
+cap imposed by this runner.
+### Isolated CXX batch artifacts
+
+Run every CXX batch with a dedicated output directory so logs, per-project
+statistics, and retained workspaces never mix with earlier trials:
+
+```bash
+python agent.py --mode initial-build \
+  --projects-file cxx_initial_build_preflight10.yaml \
+  --project-limit 10 --initial-build-parallelism 2 \
+  --experiment-output-dir experiment_runs/cxx_preflight10
+```
+
+The directory contains `agent_logs/`, `archive/<project>/<timestamp>/`, and
+`process/fixed|unfixed/`.  It is intentionally excluded from Git, as are all
+runtime logs, workspaces, and local secrets.

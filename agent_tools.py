@@ -1000,7 +1000,7 @@ def run_fuzz_build_and_validate(
         architecture: str,
         mount_path: Optional[str] = None,
         verbose_step6: bool = False,
-        verbose_build: bool = True,
+        verbose_build: bool = False,
         tool_context: ToolContext = None
 ) -> dict:
     """
@@ -3272,6 +3272,68 @@ def read_initial_build_projects_from_yaml(file_path: str) -> dict:
         return {"status": "error", "message": f"Failed to parse initial-build YAML: {exc}"}
 
 
+def _cxx_build_success_judge(dockerfile_text: str, build_output: str, *, reflection: bool,
+                             primary_reason: str = "") -> Dict[str, Any]:
+    """Run one CXXCrafter-style LLM validation pass and return structured data."""
+    dockerfile_excerpt = dockerfile_text[-16000:]
+    output_excerpt = build_output[-16000:]
+    role = "reflection" if reflection else "primary"
+    prompt = f"""You are the {role} validator from CXXCrafter.
+Decide whether this Dockerfile genuinely built the project. Return JSON only:
+{{"success": true|false, "reason": "short explanation"}}.
+
+A success requires BOTH: (1) the Dockerfile actually executes the project's
+build command, not only package installation or a marker/comment; and (2) the
+Docker build output contains real build-process evidence. Docker success alone
+is insufficient. Tests are secondary and may fail. Reject inert commands,
+comments, heredocs, or shell tricks that merely imitate a build command.
+
+Dockerfile:
+{dockerfile_excerpt}
+
+Docker output:
+{output_excerpt}
+
+Previous primary rationale (only for reflection): {primary_reason}
+"""
+    model = os.getenv("MODEL", "deepseek/deepseek-v4-flash")
+    api_key = os.getenv("API_KEY")
+    api_base = os.getenv("api_base", os.getenv("API_BASE"))
+    kwargs: Dict[str, Any] = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.0,
+        "api_key": api_key,
+        "max_tokens": 512,
+    }
+    if api_base:
+        kwargs["api_base"] = api_base
+    try:
+        response = litellm.completion(**kwargs)
+        usage_obj = getattr(response, "usage", None)
+        usage = {
+            "prompt": int(getattr(usage_obj, "prompt_tokens", 0) or 0),
+            "completion": int(getattr(usage_obj, "completion_tokens", 0) or 0),
+        }
+        content = str(response.choices[0].message.content or "").strip()
+        match = re.search(r"\{[\s\S]*\}", content)
+        parsed = json.loads(match.group(0) if match else content)
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("success"), bool):
+            raise ValueError("validator did not return a JSON object with boolean success")
+        return {"success": parsed["success"], "reason": str(parsed.get("reason", "")), "usage": usage}
+    except Exception as exc:
+        return {
+            "success": False,
+            "reason": f"{role} CXX validator unavailable or invalid: {exc}",
+            "usage": {"prompt": 0, "completion": 0},
+        }
+
+
+def _initial_build_experiment_root() -> str:
+    """Artifact/workspace root selected by the CXX batch runner."""
+    return os.path.abspath(os.environ.get("FIX_BUILD_EXPERIMENT_DIR", os.getcwd()))
+
+
 def run_initial_build_and_validate(
         project_name: str,
         project_source_path: str,
@@ -3297,7 +3359,7 @@ def run_initial_build_and_validate(
         return {"status": "error", "message": "Rejected cross-project initial build.", "validation_report": {}}
 
     source_path = os.path.abspath(project_source_path)
-    allowed_root = os.path.abspath(os.path.join(os.getcwd(), "process", "project"))
+    allowed_root = os.path.abspath(os.path.join(_initial_build_experiment_root(), "process", "project"))
     try:
         if os.path.commonpath([source_path, allowed_root]) != allowed_root:
             raise ValueError("source path is outside process/project")
@@ -3313,9 +3375,14 @@ def run_initial_build_and_validate(
         "step_5_logic_linkage": "skip: ordinary project build",
         "step_6_runtime_stability": "skip: no fuzz target runtime audit",
     }
+    validator_usage = {"prompt": 0, "completion": 0}
     if tool_context and getattr(tool_context, "session", None):
         state = tool_context.session.state
-        call_limit = int(state.get("max_internal_rounds", 6) or 6)
+        # One validation call corresponds to one Dockerfile version.  The
+        # CXX workflow permits at most eight versions in total, including the
+        # initial Dockerfile.  A caller may choose a smaller budget but cannot
+        # exceed that experiment-wide ceiling.
+        call_limit = min(8, int(state.get("initial_build_max_versions", 8) or 8))
         call_count = int(state.get("initial_build_calls", 0) or 0)
         if call_count >= call_limit:
             report["step_2_infra_compliance"] = f"fail: initial-build call budget exhausted ({call_limit})"
@@ -3325,7 +3392,23 @@ def run_initial_build_and_validate(
                 "validation_report": report,
             }
         state["initial_build_calls"] = call_count + 1
-    log_dir = os.path.join(os.getcwd(), "initial_build_log_file")
+        # If the agent validates a repository-provided Dockerfile before
+        # writing one, that existing file is still the first evaluated
+        # Dockerfile version and must consume the same project budget.
+        if int(state.get("initial_build_dockerfile_versions", 0) or 0) == 0:
+            state["initial_build_dockerfile_versions"] = 1
+        deadline = state.get("initial_build_deadline")
+        if deadline:
+            remaining = int(float(deadline) - time.time())
+            if remaining <= 0:
+                report["step_2_infra_compliance"] = "fail: initial-build project timeout after 5400s"
+                return {
+                    "status": "error",
+                    "message": report["step_2_infra_compliance"],
+                    "validation_report": report,
+                }
+            build_timeout = min(build_timeout, remaining)
+    log_dir = os.path.join(_initial_build_experiment_root(), "initial_build_log_file")
     os.makedirs(log_dir, exist_ok=True)
     safe_name = "".join(ch if ch.isalnum() or ch in "_-" else "_" for ch in project_name)
     log_path = os.path.join(log_dir, f"{safe_name}.log")
@@ -3340,7 +3423,9 @@ def run_initial_build_and_validate(
         return {"status": "error", "message": message, "log_path": log_path, "validation_report": report}
 
     image_tag = f"fix-build-initial-{safe_name.lower()}"
-    command = ["docker", "build", "--progress=plain", "--tag", image_tag, "--file", dockerfile, source_path]
+    # A cached layer does not provide dynamic evidence that this run built the
+    # current source.  CXX validation therefore always rebuilds from scratch.
+    command = ["docker", "build", "--no-cache", "--progress=plain", "--tag", image_tag, "--file", dockerfile, source_path]
     started = time.time()
     output: list[str] = []
     try:
@@ -3360,45 +3445,29 @@ def run_initial_build_and_validate(
             elif process.poll() is not None:
                 process.wait()
                 if process.returncode == 0:
-                    # CXXCrafter does not accept a successful Docker command
-                    # alone. Its discriminator checks that the Dockerfile
-                    # actually invokes the detected build system (static) and
-                    # that the output contains build-process evidence
-                    # (dynamic). Apply the same two criteria here without
-                    # mistaking package installation for a successful build.
                     dockerfile_text = Path(dockerfile).read_text(encoding="utf-8", errors="ignore")
-                    build_markers = ("cmake", "make", "ninja", "meson", "./configure", "autogen.sh", "bazel")
-                    run_segments = []
-                    for run_line in re.findall(r"^\\s*RUN\\s+(.+)$", dockerfile_text,
-                                               flags=re.IGNORECASE | re.MULTILINE):
-                        run_segments.extend(re.split(r"&&|;", run_line))
-                    static_ok = any(
-                        any(re.search(re.escape(marker), segment, flags=re.IGNORECASE)
-                            for marker in build_markers)
-                        and not re.search(r"\\b(?:apt(?:-get)?|apk|dnf|yum)\\b.*\\binstall\\b", segment,
-                                          flags=re.IGNORECASE)
-                        for segment in run_segments
-                    )
                     build_output = "".join(output)
-                    dynamic_ok = bool(re.search(
-                        r"(?:\\[\\s*\\d+%\\]\\s+Building|Built target|make(?:\\[\\d+\\])?:|"
-                        r"-- Configuring done|-- Generating done|gcc\\S*\\s+.*\\s-c\\b|"
-                        r"g\\+\\+\\s+.*\\s-c\\b|cc\\s+.*\\s-c\\b|ninja:.*(?:Building|linking))",
-                        build_output,
-                        flags=re.IGNORECASE,
-                    ))
-                    if static_ok and dynamic_ok:
-                        report["step_1_official_list"] = "pass: CXX static and dynamic build criteria"
+                    primary = _cxx_build_success_judge(
+                        dockerfile_text, build_output, reflection=False
+                    )
+                    validator_usage["prompt"] += primary["usage"]["prompt"]
+                    validator_usage["completion"] += primary["usage"]["completion"]
+                    reflection = {"success": False, "reason": "primary CXX validation failed", "usage": {"prompt": 0, "completion": 0}}
+                    if primary["success"]:
+                        reflection = _cxx_build_success_judge(
+                            dockerfile_text, build_output, reflection=True, primary_reason=primary["reason"]
+                        )
+                        validator_usage["prompt"] += reflection["usage"]["prompt"]
+                        validator_usage["completion"] += reflection["usage"]["completion"]
+                    if primary["success"] and reflection["success"]:
+                        report["step_1_official_list"] = "pass: CXX primary and reflection validation"
                         report["step_2_infra_compliance"] = "pass"
                         report["step_6_runtime_stability"] = "skip: ordinary Docker image build"
                     else:
-                        missing = []
-                        if not static_ok:
-                            missing.append("Dockerfile lacks an explicit build-system command")
-                        if not dynamic_ok:
-                            missing.append("build output lacks build-process evidence")
-                        report["step_1_official_list"] = "fail: " + "; ".join(missing)
-                        report["step_2_infra_compliance"] = "fail: CXX build-success criteria not met"
+                        report["step_1_official_list"] = (
+                            f"fail: primary={primary['reason']}; reflection={reflection['reason']}"
+                        )
+                        report["step_2_infra_compliance"] = "fail: CXX build-success validation rejected"
                 else:
                     report["step_2_infra_compliance"] = f"fail: Docker build exited {process.returncode}"
                 break
@@ -3417,6 +3486,14 @@ def run_initial_build_and_validate(
         "message": "Initial Docker build succeeded" if success else "Initial Docker build failed",
         "log_path": log_path,
         "validation_report": report,
+        "validator_usage": validator_usage,
+        "validator_checks": {
+            "primary": report["step_1_official_list"],
+            "reflection": "pass" if report["step_2_infra_compliance"] == "pass" else "fail",
+        },
+        "dockerfile_versions_used": int(
+            tool_context.session.state.get("initial_build_dockerfile_versions", 0)
+        ) if tool_context and getattr(tool_context, "session", None) else 0,
     }
 
 
@@ -4458,6 +4535,50 @@ def create_or_update_file(file_path: str, content: str, **kwargs) -> dict:
         message = f"An error occurred while creating or updating file '{file_path}': {str(e)}"
         print(message)
         return {"status": "error", "message": message}
+
+
+def create_or_update_initial_build_file(file_path: str, content: str,
+                                        tool_context: ToolContext = None, **kwargs) -> dict:
+    """Controlled writer for CXX initial-build projects.
+
+    It permits Dockerfile and source changes, but counts every Dockerfile write
+    against the project-wide eight-version budget before touching disk.
+    """
+    source_path = ""
+    state: Dict[str, Any] = {}
+    if tool_context and getattr(tool_context, "session", None):
+        state = tool_context.session.state
+        source_path = os.path.abspath(str(state.get("project_source_path", "")))
+    resolved = os.path.abspath(file_path) if os.path.isabs(file_path) else os.path.abspath(os.path.join(os.getcwd(), file_path))
+    if not source_path or os.path.commonpath([resolved, source_path]) != source_path:
+        return {"status": "error", "message": "Initial-build writes must stay inside the active project source directory."}
+    if os.path.basename(resolved).lower() == "dockerfile":
+        limit = min(8, int(state.get("initial_build_max_versions", 8) or 8))
+        used = int(state.get("initial_build_dockerfile_versions", 0) or 0)
+        if used >= limit:
+            return {"status": "error", "message": f"Dockerfile version budget exhausted ({limit})."}
+        result = create_or_update_file(resolved, content, **kwargs)
+        if result.get("status") == "success":
+            state["initial_build_dockerfile_versions"] = used + 1
+            result["dockerfile_versions_used"] = used + 1
+        return result
+    return create_or_update_file(resolved, content, **kwargs)
+
+
+def read_initial_build_log(project_name: str, max_chars: int = 16000,
+                           tool_context: ToolContext = None) -> dict:
+    """Read a bounded initial-build log without exposing generic shell access."""
+    if _ACTIVE_PROJECT_NAME and project_name != _ACTIVE_PROJECT_NAME:
+        return {"status": "error", "message": "Rejected cross-project initial-build log read."}
+    if max_chars < 1 or max_chars > 16000:
+        return {"status": "error", "message": "max_chars must be 1..16000."}
+    safe_name = "".join(ch if ch.isalnum() or ch in "_-" else "_" for ch in project_name)
+    path = os.path.join(_initial_build_experiment_root(), "initial_build_log_file", f"{safe_name}.log")
+    try:
+        content = Path(path).read_text(encoding="utf-8", errors="ignore")
+        return {"status": "success", "log_path": path, "content": content[-max_chars:], "truncated": len(content) > max_chars}
+    except FileNotFoundError:
+        return {"status": "error", "message": f"Initial-build log not found: {path}"}
 
 
 def append_file_to_file(

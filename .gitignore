@@ -3,3 +3,8 @@
 .idea/
 __pycache__/
 *.py[cod]
+/agent_logs/
+/archive/
+/process/
+/initial_build_log_file/
+/experiment_runs/

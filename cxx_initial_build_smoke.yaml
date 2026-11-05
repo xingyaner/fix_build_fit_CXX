@@ -3,8 +3,13 @@
   mode: initial_build
   fixed_state: 'no'
   state: 'no'
-- project: mold
-  source_repo_url: https://github.com/rui314/mold.git
+- project: guetzli
+  source_repo_url: https://github.com/google/guetzli.git
+  mode: initial_build
+  fixed_state: 'no'
+  state: 'no'
+- project: simdjson
+  source_repo_url: https://github.com/simdjson/simdjson.git
   mode: initial_build
   fixed_state: 'no'
   state: 'no'

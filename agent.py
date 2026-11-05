@@ -10,6 +10,7 @@ import asyncio
 import subprocess
 import shutil
 import tempfile
+import sys
 import litellm
 import logging
 import agent_tools
@@ -57,6 +58,8 @@ from agent_tools import (
     get_git_commits_around_date,
     save_commit_diff_to_file,
     create_or_update_file,
+    create_or_update_initial_build_file,
+    read_initial_build_log,
     run_command,
     check_file_exists,
     extract_buggy_line_info,
@@ -128,9 +131,14 @@ class LoggingWrapperAgent(BaseAgent):
             if not GLOBAL_LOGGER.file_handler_setup: GLOBAL_LOGGER.setup_file_handler()
 
 
+def _experiment_output_root() -> str:
+    """Return the isolated artifact root for a CXX experiment run."""
+    return os.path.abspath(os.environ.get("FIX_BUILD_EXPERIMENT_DIR", os.getcwd()))
+
+
 class AgentLogger:
-    def __init__(self, log_directory: str = "agent_logs"):
-        self.log_directory = log_directory
+    def __init__(self, log_directory: Optional[str] = None):
+        self.log_directory = log_directory or os.path.join(_experiment_output_root(), "agent_logs")
         self.logger = None
         self.file_handler_setup = False
         self.log_buffer = []
@@ -303,6 +311,117 @@ def cleanup_environment(project_name: str):
                 print(f"  - Warning: Failed to clean {path}: {e}")
 
 
+def _collect_initial_build_metrics(source_path: str) -> Dict[str, int]:
+    """Measure all tracked and untracked source/Dockerfile changes before cleanup."""
+    empty = {"files": 0, "added": 0, "deleted": 0, "hunks": 0}
+    if not os.path.isdir(os.path.join(source_path, ".git")):
+        return empty
+    try:
+        numstat = subprocess.run(
+            ["git", "-C", source_path, "diff", "--numstat", "HEAD"],
+            capture_output=True, text=True, check=False,
+        )
+        files: set[str] = set()
+        added = deleted = 0
+        for line in numstat.stdout.splitlines():
+            parts = line.split("\t", 2)
+            if len(parts) != 3:
+                continue
+            add, remove, path = parts
+            files.add(path)
+            added += int(add) if add.isdigit() else 0
+            deleted += int(remove) if remove.isdigit() else 0
+        untracked = subprocess.run(
+            ["git", "-C", source_path, "ls-files", "--others", "--exclude-standard"],
+            capture_output=True, text=True, check=False,
+        )
+        for path in (p.strip() for p in untracked.stdout.splitlines()):
+            if not path or path in files:
+                continue
+            files.add(path)
+            candidate = os.path.join(source_path, path)
+            try:
+                with open(candidate, "r", encoding="utf-8", errors="ignore") as handle:
+                    added += sum(1 for _ in handle)
+            except OSError:
+                pass
+        hunks = subprocess.run(
+            ["git", "-C", source_path, "diff", "--unified=0", "HEAD"],
+            capture_output=True, text=True, check=False,
+        ).stdout.count("@@") // 2
+        # Each untracked text file is one newly introduced diff hunk.
+        hunks += len(files) - len([line for line in numstat.stdout.splitlines() if line])
+        return {"files": len(files), "added": added, "deleted": deleted, "hunks": hunks}
+    except Exception as exc:
+        print(f"--- [INITIAL BUILD] Could not collect change metrics: {exc} ---")
+        return empty
+
+
+def _archive_initial_build_artifacts(
+        project_info: Dict[str, Any],
+        is_successful: bool,
+        source_path: str,
+        stats: Dict[str, Any],
+        attempt_tokens: Dict[str, int],
+        elapsed_seconds: float,
+        change_metrics: Dict[str, int],
+        validation_report: Dict[str, Any],
+        result_path: str,
+) -> Dict[str, str]:
+    """Persist every CXX run's report, build log, and workspace for analysis.
+
+    Unlike the OSS-Fuzz archive, ordinary-project runs have no downstream
+    configuration repository.  The final source workspace, Dockerfile, build
+    log, and a machine-readable metrics record are therefore the evidence
+    needed for later experiment statistics.
+    """
+    safe_name = "".join(c for c in project_info["project_name"] if c.isalnum() or c in ("_", "-")).rstrip()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    workspace_kind = "fixed" if is_successful else "unfixed"
+    experiment_root = _experiment_output_root()
+    archive_dir = os.path.join(experiment_root, "archive", safe_name, timestamp)
+    process_dir = os.path.join(experiment_root, "process", workspace_kind, f"{safe_name}_{timestamp}")
+    os.makedirs(archive_dir, exist_ok=True)
+    os.makedirs(process_dir, exist_ok=True)
+
+    build_log_path = os.path.join(experiment_root, "initial_build_log_file", f"{safe_name}.log")
+    for source_file, target_name in ((result_path, "result.txt"), (build_log_path, "initial_build.log")):
+        if os.path.isfile(source_file):
+            shutil.copy2(source_file, os.path.join(archive_dir, target_name))
+            shutil.copy2(source_file, os.path.join(process_dir, target_name))
+
+    metrics = {
+        "project": project_info["project_name"],
+        "source_repo_url": project_info.get("source_repo_url", ""),
+        "build_mode": "initial-build",
+        "result": "Success" if is_successful else "Failure",
+        "attempt_rounds": 1,
+        "repair_rounds": int(stats.get("repair_rounds", 0)),
+        "infrastructure_retries": int(stats.get("infrastructure_retries", 0)),
+        "build_calls": int(stats.get("build_calls", 0)),
+        "dockerfile_versions": int(stats.get("dockerfile_versions", 0)),
+        "cxx_double_validation": stats.get("validator_checks", "not-run"),
+        "time_cost_seconds": round(elapsed_seconds, 3),
+        "input_tokens": int(attempt_tokens.get("prompt", 0)),
+        "output_tokens": int(attempt_tokens.get("completion", 0)),
+        "files_change": int(change_metrics.get("files", 0)),
+        "lines_added": int(change_metrics.get("added", 0)),
+        "lines_deleted": int(change_metrics.get("deleted", 0)),
+        "lines_change": int(change_metrics.get("added", 0)) + int(change_metrics.get("deleted", 0)),
+        "diff_hunks": int(change_metrics.get("hunks", 0)),
+        "validation_report": validation_report,
+        "archived_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    for destination in (archive_dir, process_dir):
+        with open(os.path.join(destination, "experiment_stats.json"), "w", encoding="utf-8") as handle:
+            json.dump(metrics, handle, ensure_ascii=False, indent=2)
+
+    if os.path.isdir(source_path):
+        shutil.move(source_path, os.path.join(process_dir, "source"))
+    print(f"--- 📦 CXX artifacts archived: {archive_dir} | {process_dir} ---")
+    return {"archive_dir": archive_dir, "process_dir": process_dir}
+
+
 def _generate_final_report(
         project_info: dict,
         is_successful: bool,
@@ -314,6 +433,7 @@ def _generate_final_report(
         attempt_last_patch_files: int,
         attempt_last_patch_lines: int,
         final_patch_snapshot: Optional[Dict[str, str]] = None,
+        initial_build_metrics: Optional[Dict[str, int]] = None,
 ):
     """
     汇总并输出项目修复最终报告，写入 result.txt 并归档。
@@ -372,6 +492,11 @@ def _generate_final_report(
             final_hunks = patch_metrics["hunks"]
     except Exception as exc:
         print(f"--- ⚠️ [REPORT] Final Git metric calculation failed; using fallback counters: {exc} ---")
+    if build_mode == "initial-build" and initial_build_metrics:
+        final_files = initial_build_metrics["files"]
+        final_added = initial_build_metrics["added"]
+        final_deleted = initial_build_metrics["deleted"]
+        final_hunks = initial_build_metrics["hunks"]
 
     report_lines = [
         "============================================================",
@@ -382,6 +507,11 @@ def _generate_final_report(
         f"  - [Result]: {result_icon}",
         f"  - [Attempt Rounds]: {attempt_id}",
         f"  - [Repair Rounds]: {repair_rounds}",
+        *([
+            f"  - [Dockerfile Versions]: {stats.get('dockerfile_versions', 0)}/8",
+            f"  - [Infrastructure Retries]: {stats.get('infrastructure_retries', 0)}",
+            f"  - [CXX Double Validation]: {stats.get('validator_checks', 'not-run')}",
+        ] if build_mode == "initial-build" else []),
         f"  - [Rollback]: {rollback_count}",
         f"  - [Root Cause Location]: {root_cause_located}",
         f"  - [Expert Match]: {attempt_expert_matched}",
@@ -404,7 +534,11 @@ def _generate_final_report(
         pass  # 控制台输出失败不中断后续步骤
 
     # ── 5. 写入 result.txt ───────────────────────────────────────────────
-    result_txt_path = "result.txt"
+    # Parallel CXX workers receive a private report directory.  The legacy
+    # OSS-Fuzz mode continues to write result.txt in the repository root.
+    report_root = os.environ.get("FIX_BUILD_REPORT_DIR", _experiment_output_root())
+    os.makedirs(report_root, exist_ok=True)
+    result_txt_path = os.path.join(report_root, "result.txt")
     try:
         with open(result_txt_path, 'w', encoding='utf-8') as f:
             f.write(report_text + "\n")
@@ -412,20 +546,24 @@ def _generate_final_report(
     except Exception as e:
         print(f"--- ⚠️ [REPORT] Failed to write result.txt: {e} ---")
 
-    # ── 6. 归档 result.txt 到项目归档目录 ───────────────────────────────
-    try:
-        safe_name = "".join(c for c in project_name if c.isalnum() or c in ('_', '-')).rstrip()
-        archive_dir = os.path.join(os.getcwd(), "archive", safe_name)
-        os.makedirs(archive_dir, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        archive_path = os.path.join(archive_dir, f"result_{timestamp}.txt")
-        with open(result_txt_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        with open(archive_path, 'w', encoding='utf-8') as f:
-            f.write(content)
-        print(f"--- 📦 result.txt archived to: {archive_path} ---")
-    except Exception as e:
-        print(f"--- ⚠️ [REPORT] Failed to archive result.txt: {e} ---")
+    # CXX runs use _archive_initial_build_artifacts(), which writes a complete
+    # per-project evidence directory. Keep the legacy flat result archive only
+    # for the original OSS-Fuzz workflow.
+    if build_mode != "initial-build":
+        try:
+            safe_name = "".join(c for c in project_name if c.isalnum() or c in ('_', '-')).rstrip()
+            archive_dir = os.path.join(report_root, "archive", safe_name)
+            os.makedirs(archive_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            archive_path = os.path.join(archive_dir, f"result_{timestamp}.txt")
+            with open(result_txt_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            with open(archive_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            print(f"--- 📦 result.txt archived to: {archive_path} ---")
+        except Exception as e:
+            print(f"--- ⚠️ [REPORT] Failed to archive result.txt: {e} ---")
+    return result_txt_path
 
 
 def exit_loop(tool_context: ToolContext):
@@ -444,13 +582,18 @@ USER_ID = "default_user"
 MAX_RETRIES = 2
 MAX_INTERNAL_ROUNDS = 6
 PROJECT_TIMEOUT_LIMIT = 10800
+# CXXCrafter-compatible initial-build limits.  These are intentionally
+# independent from the OSS-Fuzz workflow limits above.
+INITIAL_BUILD_TIMEOUT_LIMIT = 90 * 60
+INITIAL_BUILD_MAX_DOCKERFILE_VERSIONS = 8
+INITIAL_BUILD_PARALLELISM = 5
 LLM_SEED = 42
 top_p = 0.9
 ENABLE_PATCH_OPTIMIZATION = False
 PATCH_OPTIMIZATION_MAX_ITERATIONS = 2
 PROJECT_LIMIT = 0
 RUN_MODE = "oss-fuzz"
-PROJECTS_FILE = "projects.yaml"
+PROJECTS_FILE = "yamls/projects.yaml"
 _OPTIMIZATION_RECOVERY_BASELINE = None
 
 
@@ -1236,10 +1379,9 @@ def initialize_initial_build_agent() -> LlmAgent:
             download_github_repo,
             list_files_in_dir,
             read_file_content,
-            create_or_update_file,
+            create_or_update_initial_build_file,
             run_initial_build_and_validate,
-            run_command,
-            manage_git_state,
+            read_initial_build_log,
         ],
         output_key="initial_build_result",
     )
@@ -1249,12 +1391,25 @@ async def process_initial_build_project(project_info: Dict, yaml_path: str, row_
     """Run one CXX project while retaining the existing resource-report shape."""
     project_name = project_info["project_name"]
     safe_name = "".join(c for c in project_name if c.isalnum() or c in ("_", "-")).rstrip()
-    source_path = os.path.join(os.getcwd(), "process", "project", safe_name)
+    source_path = os.path.join(_experiment_output_root(), "process", "project", safe_name)
+    # Every run starts from a fresh clone.  This prevents a previous project's
+    # Dockerfile, helper scripts, build artifacts, or checkout from affecting
+    # the next CXX result.
+    if os.path.exists(source_path):
+        safe_delete_path(source_path)
     started = time.time()
+    deadline = started + INITIAL_BUILD_TIMEOUT_LIMIT
     attempt_tokens = {"prompt": 0, "completion": 0, "total": 0}
-    stats = {"repair_rounds": 0, "build_calls": 0, "total_tokens": dict(attempt_tokens), "code_gen_tokens": 0}
+    stats = {
+        "repair_rounds": 0, "infrastructure_retries": 0,
+        "build_calls": 0, "dockerfile_versions": 0,
+        "validator_checks": "not-run", "total_tokens": dict(attempt_tokens), "code_gen_tokens": 0,
+    }
     successful = False
     attempt_id = 0
+    last_validation_report: Dict[str, Any] = {}
+    failed_build_pending_repair = False
+    repair_action_recorded_for_failure = False
 
     agent_tools._LATEST_BASIC_INFORMATION = {}
     agent_tools.set_active_project_context(project_name)
@@ -1263,7 +1418,10 @@ async def process_initial_build_project(project_info: Dict, yaml_path: str, row_
     GLOBAL_LOGGER.set_project_context(project_name)
 
     try:
-        for attempt_id in range(1, MAX_RETRIES + 1):
+        # The CXX budget is project-wide: one agent session may evaluate at
+        # most eight Dockerfile versions.  Starting a second outer attempt
+        # would reset the session counter and silently exceed that budget.
+        for attempt_id in range(1, 2):
             service = InMemorySessionService()
             session_id = f"initial_build_{safe_name}_{int(time.time())}_at{attempt_id}"
             await service.create_session(app_name=APP_NAME, user_id=USER_ID, session_id=session_id)
@@ -1273,7 +1431,8 @@ async def process_initial_build_project(project_info: Dict, yaml_path: str, row_
                 "project_source_path": source_path,
                 "build_mode": "initial_build",
                 "attempt_id": attempt_id,
-                "max_internal_rounds": MAX_INTERNAL_ROUNDS,
+                "initial_build_max_versions": INITIAL_BUILD_MAX_DOCKERFILE_VERSIONS,
+                "initial_build_deadline": deadline,
                 "last_validation_report": {},
             })
 
@@ -1283,10 +1442,11 @@ async def process_initial_build_project(project_info: Dict, yaml_path: str, row_
                 "source_repo_url": project_info["source_repo_url"],
                 "project_source_path": source_path,
                 "attempt_id": attempt_id,
-                "max_internal_rounds": MAX_INTERNAL_ROUNDS,
+                "initial_build_max_versions": INITIAL_BUILD_MAX_DOCKERFILE_VERSIONS,
+                "initial_build_deadline": deadline,
             })
             message = types.Content(parts=[types.Part(text=payload)], role="user")
-            print(f"--- Starting initial-build attempt {attempt_id}/{MAX_RETRIES}: {project_name} ---")
+            print(f"--- Starting initial-build attempt {attempt_id}/1: {project_name} ---")
             gen = runner.run_async(user_id=USER_ID, session_id=session_id, new_message=message)
             try:
                 async for event in gen:
@@ -1302,26 +1462,67 @@ async def process_initial_build_project(project_info: Dict, yaml_path: str, row_
                         stats["total_tokens"]["total"] += prompt + completion
                         stats["code_gen_tokens"] += completion
                     for response in event.get_function_responses() or []:
+                        response_body = response.response or {}
+                        if response.name == "create_or_update_initial_build_file":
+                            # Only edits made after a failed build count as a
+                            # repair.  Several edits before the next build are
+                            # one repair round, not several repairs.
+                            if (
+                                failed_build_pending_repair
+                                and not repair_action_recorded_for_failure
+                                and response_body.get("status") == "success"
+                            ):
+                                stats["repair_rounds"] += 1
+                                repair_action_recorded_for_failure = True
+                            continue
                         if response.name != "run_initial_build_and_validate":
                             continue
                         stats["build_calls"] += 1
-                        stats["repair_rounds"] = max(0, stats["build_calls"] - 1)
-                        validation = response.response.get("validation_report", {})
+                        stats["dockerfile_versions"] = max(
+                            stats["dockerfile_versions"],
+                            int(response.response.get("dockerfile_versions_used", 0) or 0),
+                        )
+                        build_succeeded = _is_step_2_success(
+                            response_body.get("validation_report", {})
+                        )
+                        if build_succeeded and failed_build_pending_repair and not repair_action_recorded_for_failure:
+                            # The preceding failure was retried without a
+                            # workspace edit; record it separately so it is
+                            # never mistaken for a repair.
+                            stats["infrastructure_retries"] += 1
+                        if build_succeeded:
+                            failed_build_pending_repair = False
+                            repair_action_recorded_for_failure = False
+                        else:
+                            failed_build_pending_repair = True
+                            repair_action_recorded_for_failure = False
+                        validator_usage = response.response.get("validator_usage", {}) or {}
+                        validator_prompt = int(validator_usage.get("prompt", 0) or 0)
+                        validator_completion = int(validator_usage.get("completion", 0) or 0)
+                        attempt_tokens["prompt"] += validator_prompt
+                        attempt_tokens["completion"] += validator_completion
+                        attempt_tokens["total"] += validator_prompt + validator_completion
+                        stats["validator_checks"] = response.response.get("validator_checks", {}).get(
+                            "primary", "not-run"
+                        )
+                        validation = response_body.get("validation_report", {})
+                        last_validation_report = validation
                         session.state["last_validation_report"] = validation
                         if _is_step_2_success(validation):
                             successful = True
                             break
-                    if successful or time.time() - started > PROJECT_TIMEOUT_LIMIT:
+                    if successful or time.time() >= deadline:
                         break
             finally:
                 await gen.aclose()
-            if successful or time.time() - started > PROJECT_TIMEOUT_LIMIT:
+            if successful or time.time() >= deadline:
                 break
     except Exception as exc:
         print(f"--- [INITIAL BUILD] Project {project_name} failed: {exc} ---")
         GLOBAL_LOGGER.log_raw(f"[INITIAL BUILD EXCEPTION] {project_name}: {exc}")
     finally:
-        _generate_final_report(
+        initial_build_metrics = _collect_initial_build_metrics(source_path)
+        result_path = _generate_final_report(
             project_info={"project_name": project_name, "error_time": "initial-build", "mode": "initial-build"},
             is_successful=successful,
             attempt_id=attempt_id,
@@ -1331,9 +1532,119 @@ async def process_initial_build_project(project_info: Dict, yaml_path: str, row_
             attempt_expert_matched=False,
             attempt_last_patch_files=0,
             attempt_last_patch_lines=0,
+            initial_build_metrics=initial_build_metrics,
         )
+        try:
+            _archive_initial_build_artifacts(
+                project_info=project_info,
+                is_successful=successful,
+                source_path=source_path,
+                stats=stats,
+                attempt_tokens=attempt_tokens,
+                elapsed_seconds=time.time() - started,
+                change_metrics=initial_build_metrics,
+                validation_report=last_validation_report,
+                result_path=result_path,
+            )
+            # In direct single-project runs the transient report is written at
+            # the repository root.  Its permanent copy now lives in the new
+            # per-project archive, so remove the legacy root artifact.
+            if os.path.abspath(os.path.dirname(result_path)) == _experiment_output_root():
+                safe_delete_path(result_path)
+        except Exception as archive_error:
+            # A failed archival must not hide the actual build outcome. Keep
+            # the workspace in process/project for manual recovery instead.
+            print(f"--- ⚠️ [INITIAL BUILD] Artifact archive failed: {archive_error} ---")
         agent_tools.set_project_phase("idle")
     return successful
+
+
+async def _run_initial_build_worker(project_entry: Dict[str, Any], worker_index: int) -> tuple[bool, str, str]:
+    """Run one initial-build project in an isolated child process.
+
+    The parent owns the real queue YAML.  Each child receives a one-record
+    temporary queue and the parent merges only its final result, avoiding
+    concurrent writes to the experiment queue while allowing Docker/LLM work
+    to run in separate processes.
+    """
+    import yaml
+
+    project_name = str(project_entry.get("project", f"worker-{worker_index}"))
+    safe_name = "".join(c for c in project_name if c.isalnum() or c in ("_", "-")) or f"worker-{worker_index}"
+    worker_dir = tempfile.mkdtemp(prefix=f"cxx-initial-{safe_name}-")
+    queue_path = os.path.join(worker_dir, "queue.yaml")
+    report_dir = os.path.join(worker_dir, "report")
+    os.makedirs(report_dir, exist_ok=True)
+    with open(queue_path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump([project_entry], handle, sort_keys=False, allow_unicode=True)
+
+    command = [
+        sys.executable, "agent.py",
+        "--mode", "initial-build",
+        "--projects-file", queue_path,
+        "--project-limit", "1",
+        "--initial-build-timeout-seconds", str(INITIAL_BUILD_TIMEOUT_LIMIT),
+        "--initial-build-max-versions", str(INITIAL_BUILD_MAX_DOCKERFILE_VERSIONS),
+        "--initial-build-parallelism", "1",
+    ]
+    env = os.environ.copy()
+    env["FIX_BUILD_REPORT_DIR"] = report_dir
+    proc = await asyncio.create_subprocess_exec(
+        *command,
+        cwd=os.getcwd(),
+        env=env,
+        # Let every worker stream directly to the terminal.  Its own
+        # StreamTee records the same output in agent_logs/<project>_run_*.log.
+        # Capturing stdout here delayed all visible progress until completion.
+    )
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=INITIAL_BUILD_TIMEOUT_LIMIT)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        print(f"--- [INITIAL-BUILD PARENT TIMEOUT] {project_name}: 5400 seconds ---")
+
+    try:
+        with open(queue_path, "r", encoding="utf-8") as handle:
+            completed = yaml.safe_load(handle) or []
+        result = str(completed[0].get("fix_result", "Failure")) == "Success"
+    except Exception:
+        result = False
+    if proc.returncode != 0:
+        result = False
+    return result, project_name, os.path.join(report_dir, "result.txt")
+
+
+async def process_initial_build_batch(projects: List[Dict[str, Any]], yaml_path: str) -> None:
+    """Run CXX initial-build projects with a hard five-process maximum."""
+    import yaml
+
+    with open(yaml_path, "r", encoding="utf-8") as handle:
+        queue_entries = yaml.safe_load(handle) or []
+    semaphore = asyncio.Semaphore(INITIAL_BUILD_PARALLELISM)
+    project_locks: Dict[str, asyncio.Lock] = {}
+
+    async def bounded(project_info: Dict[str, Any]) -> tuple[bool, Dict[str, Any], str]:
+        async with semaphore:
+            project_name = project_info["project_name"]
+            lock = project_locks.setdefault(project_name, asyncio.Lock())
+            async with lock:
+                entry = queue_entries[project_info["row_index"]]
+                success, _, report_path = await _run_initial_build_worker(entry, project_info["row_index"])
+                return success, project_info, report_path
+
+    results = await asyncio.gather(*(bounded(project) for project in projects))
+    for success, project_info, report_path in results:
+        result_str = "Success" if success else "Failure"
+        update_result = update_yaml_report(yaml_path, project_info["row_index"], result_str)
+        if update_result["status"] == "error":
+            print(f"--- [CRITICAL] Could not update YAML report: {update_result['message']} ---")
+        # The child has already written its complete timestamped evidence set
+        # through _archive_initial_build_artifacts().  Do not recreate the
+        # retired flat archive/<project>/result_*.txt layout in the parent.
+        if not os.path.exists(report_path):
+            print(f"--- ⚠️ [INITIAL-BUILD PARENT] Child report unavailable for {project_info['project_name']}; see agent_logs/. ---")
+        print(f"--- Initial-build project {project_info['project_name']} complete. Result: {result_str} ---")
 
 
 async def _repair_optimizer_candidate(project_info: Dict, source_path: str,
@@ -2124,6 +2435,15 @@ async def main():
     print(f"--- Found {len(projects_to_process)} projects to process ---")
 
     selected_projects = projects_to_process[:PROJECT_LIMIT] if PROJECT_LIMIT > 0 else projects_to_process
+    if RUN_MODE == "initial-build" and INITIAL_BUILD_PARALLELISM > 1:
+        print(
+            f"--- Running {len(selected_projects)} CXX initial-build projects with "
+            f"at most {INITIAL_BUILD_PARALLELISM} child processes; "
+            f"timeout={INITIAL_BUILD_TIMEOUT_LIMIT}s, versions={INITIAL_BUILD_MAX_DOCKERFILE_VERSIONS}. ---"
+        )
+        await process_initial_build_batch(selected_projects, YAML_FILE)
+        print("\n--- All projects in the queue have been processed. Workflow finished. ---")
+        return
     for project_info in selected_projects:
         try:
             project_name = project_info['project_name']
@@ -2206,9 +2526,17 @@ if __name__ == "__main__":
                         help="Maximum normal repair attempts (default: 2)")
     parser.add_argument("--max-internal-rounds", type=int, default=6,
                         help="Maximum normal repair workflow rounds per attempt (default: 6)")
+    parser.add_argument("--initial-build-timeout-seconds", type=int, default=90 * 60,
+                        help="CXX initial-build project time limit in seconds (maximum: 5400)")
+    parser.add_argument("--initial-build-max-versions", type=int, default=8,
+                        help="CXX initial-build Dockerfile versions, including the initial version (maximum: 8)")
+    parser.add_argument("--initial-build-parallelism", type=int, default=5,
+                        help="CXX initial-build child processes (maximum: 5)")
+    parser.add_argument("--experiment-output-dir", default="",
+                        help="Separate CXX experiment artifacts (logs, archive, process) into this directory")
     parser.add_argument("--mode", choices=("oss-fuzz", "initial-build"), default="oss-fuzz",
                         help="oss-fuzz replays known failures; initial-build repairs ordinary C/C++ Docker builds")
-    parser.add_argument("--projects-file", default="projects.yaml",
+    parser.add_argument("--projects-file", default="yamls/projects.yaml",
                         help="Task YAML. Use cxx_initial_build_projects.yaml with --mode initial-build")
     args = parser.parse_args()
     if args.optimization_max_iterations < 1:
@@ -2219,13 +2547,26 @@ if __name__ == "__main__":
         parser.error("--max-retries must be at least 1")
     if args.max_internal_rounds < 1:
         parser.error("--max-internal-rounds must be at least 1")
+    if not 1 <= args.initial_build_timeout_seconds <= 90 * 60:
+        parser.error("--initial-build-timeout-seconds must be between 1 and 5400")
+    if not 1 <= args.initial_build_max_versions <= 8:
+        parser.error("--initial-build-max-versions must be between 1 and 8")
+    if not 1 <= args.initial_build_parallelism <= 5:
+        parser.error("--initial-build-parallelism must be between 1 and 5")
     ENABLE_PATCH_OPTIMIZATION = args.optimize_patch
     PATCH_OPTIMIZATION_MAX_ITERATIONS = args.optimization_max_iterations
     PROJECT_LIMIT = args.project_limit
     MAX_RETRIES = args.max_retries
     MAX_INTERNAL_ROUNDS = args.max_internal_rounds
+    INITIAL_BUILD_TIMEOUT_LIMIT = args.initial_build_timeout_seconds
+    INITIAL_BUILD_MAX_DOCKERFILE_VERSIONS = args.initial_build_max_versions
+    INITIAL_BUILD_PARALLELISM = args.initial_build_parallelism
     RUN_MODE = args.mode
     PROJECTS_FILE = args.projects_file
+    if args.experiment_output_dir:
+        experiment_output_dir = os.path.abspath(args.experiment_output_dir)
+        os.environ["FIX_BUILD_EXPERIMENT_DIR"] = experiment_output_dir
+        GLOBAL_LOGGER.log_directory = os.path.join(experiment_output_dir, "agent_logs")
     print("--- Performing pre-startup checks... ---")
     sys.stdout = StreamTee(sys.stdout, GLOBAL_LOGGER)
     sys.stderr = StreamTee(sys.stderr, GLOBAL_LOGGER)
