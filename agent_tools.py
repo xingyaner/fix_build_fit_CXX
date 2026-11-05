@@ -3923,6 +3923,7 @@ def download_github_repo(project_name: str, target_dir: str, repo_url: Optional[
     import shutil
 
     current_work_dir = os.getcwd()
+    experiment_root = os.path.abspath(os.environ.get("FIX_BUILD_EXPERIMENT_DIR", current_work_dir))
 
     phase_error = _reject_if_project_phase_stopped("repository setup")
     if phase_error:
@@ -3941,7 +3942,9 @@ def download_github_repo(project_name: str, target_dir: str, repo_url: Optional[
         final_target_dir = os.path.abspath(target_dir)
     else:
         safe_name = "".join(c for c in project_name if c.isalnum() or c in ('_', '-')).rstrip()
-        final_target_dir = os.path.abspath(os.path.join(current_work_dir, "process", "project", safe_name))
+        # CXX batches may opt into an isolated artifact/workspace root.  Keep
+        # the original repository root as the default for OSS-Fuzz workflows.
+        final_target_dir = os.path.abspath(os.path.join(experiment_root, "process", "project", safe_name))
 
         if os.path.abspath(target_dir) != final_target_dir:
             print(f"--- Path Security Enforcement: Redirecting download from {target_dir} to {final_target_dir} ---")
