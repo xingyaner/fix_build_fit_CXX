@@ -2567,6 +2567,7 @@ if __name__ == "__main__":
         experiment_output_dir = os.path.abspath(args.experiment_output_dir)
         os.environ["FIX_BUILD_EXPERIMENT_DIR"] = experiment_output_dir
         GLOBAL_LOGGER.log_directory = os.path.join(experiment_output_dir, "agent_logs")
+        os.makedirs(GLOBAL_LOGGER.log_directory, exist_ok=True)
     print("--- Performing pre-startup checks... ---")
     sys.stdout = StreamTee(sys.stdout, GLOBAL_LOGGER)
     sys.stderr = StreamTee(sys.stderr, GLOBAL_LOGGER)
